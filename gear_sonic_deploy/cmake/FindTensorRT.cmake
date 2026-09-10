@@ -28,7 +28,9 @@
 # ~~~
 
 if(NOT TensorRT_FIND_COMPONENTS)
-  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser nvparsers)
+  # nvparsers was removed from modern TensorRT; SONIC only needs the core,
+  # plugin, and ONNX parser libraries.
+  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser)
 endif()
 set(TensorRT_LIBRARIES)
 
@@ -113,4 +115,3 @@ endforeach()
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(TensorRT HANDLE_COMPONENTS VERSION_VAR TensorRT_VERSION REQUIRED_VARS TensorRT_INCLUDE_DIR)
-

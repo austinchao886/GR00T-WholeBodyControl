@@ -20,13 +20,25 @@
 #define ROBOT_PARAMETERS_HPP
 
 #include <array>
+#include <cstdlib>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Unitree SDK DDS topic names
 // ---------------------------------------------------------------------------
-static const std::string HG_CMD_TOPIC = "rt/lowcmd";       ///< Low-level motor command topic.
+inline std::string TopicFromEnvironment(const char* variable, const char* fallback) {
+  const char* value = std::getenv(variable);
+  return (value != nullptr && value[0] != '\0') ? value : fallback;
+}
+
+// Simulation-only names are the safe defaults. A real-robot deployment must
+// opt in explicitly by setting these environment variables to Unitree's
+// standard rt/lowcmd and rt/lowstate topics.
+static const std::string HG_CMD_TOPIC = TopicFromEnvironment(
+    "SONIC_LOWCMD_TOPIC", "rt/socialnav_sim/g1/lowcmd");
 static const std::string HG_IMU_TORSO = "rt/secondary_imu";///< Secondary (torso) IMU topic.
-static const std::string HG_STATE_TOPIC = "rt/lowstate";    ///< Low-level motor / sensor state topic.
+static const std::string HG_STATE_TOPIC = TopicFromEnvironment(
+    "SONIC_LOWSTATE_TOPIC", "rt/socialnav_sim/g1/lowstate");
 
 /// Total number of actuated joints on the G1 (29-DOF configuration).
 const int G1_NUM_MOTOR = 29;

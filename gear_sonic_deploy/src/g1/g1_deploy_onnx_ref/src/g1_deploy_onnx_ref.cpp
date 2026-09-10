@@ -46,6 +46,7 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <atomic>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -58,6 +59,7 @@
 #include <chrono>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 #include <fstream>
@@ -65,6 +67,8 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <limits>
+#include <stdexcept>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -179,6 +183,21 @@ class G1Deploy {
     int counter_;          ///< General-purpose tick counter.
     Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
     uint8_t mode_machine_; ///< Robot variant code received from LowState.
+    bool sync_reference_to_sim_tick_ = false;
+    bool sim_allow_idle_lowstate_gap_ = false;
+    bool sim_idle_lowstate_gap_active_ = false;
+    bool sim_tick_initialized_ = false;
+    uint32_t last_sim_control_tick_ = 0;
+    uint32_t sim_tick_delta_per_control_ = 4;  // Isaac: 200 Hz physics / 50 Hz policy
+    uint32_t sim_history_warmup_ticks_ = 0;
+    uint32_t sim_history_warmup_remaining_ = 0;
+    double sim_action_slew_rate_rad_s_ = 0.0;
+    double sim_action_slew_catchup_error_rad_ = 0.05;
+    uint32_t sim_action_slew_catchup_ticks_ = 10;
+    uint32_t sim_action_slew_caught_up_ticks_ = 0;
+    std::atomic<bool> sim_action_slew_active_ {false};
+    std::atomic<bool> sim_action_slew_ready_ {false};
+    std::array<double, G1_NUM_MOTOR> sim_applied_action_ {0.0};
     
     // =========================================================================
     // Input interface and buffered input data
@@ -2180,9 +2199,105 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
-      
+      // The physical G1 command writer remains at the upstream 500 Hz default.
+      // A simulator with a 200 Hz physics servo cannot consume more than one
+      // command per physics step, so allow an explicit simulation-only rate
+      // override instead of flooding its Python DDS callback with duplicates.
+      const char* sim_publish_hz_env = std::getenv("SONIC_SIM_COMMAND_PUBLISH_HZ");
+      if (sim_publish_hz_env) {
+        const double sim_publish_hz = std::stod(sim_publish_hz_env);
+        if (!std::isfinite(sim_publish_hz) || sim_publish_hz <= 0.0 || sim_publish_hz > 500.0) {
+          throw std::invalid_argument(
+              "SONIC_SIM_COMMAND_PUBLISH_HZ must be in (0, 500]");
+        }
+        publish_dt_ = 1.0 / sim_publish_hz;
+        std::cout << "Simulation LowCmd publish rate: " << sim_publish_hz
+                  << " Hz" << std::endl;
+      }
+
       // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      const char* domain_env = std::getenv("SONIC_DDS_DOMAIN");
+      const int dds_domain = domain_env ? std::stoi(domain_env) : 0;
+      std::cout << "Using DDS domain " << dds_domain << std::endl;
+      sync_reference_to_sim_tick_ =
+          std::getenv("SONIC_SIM_SYNC_REFERENCE_TO_LOWSTATE_TICK") != nullptr;
+      if (sync_reference_to_sim_tick_) {
+        const char* tick_delta_env =
+            std::getenv("SONIC_SIM_TICK_DELTA_PER_CONTROL");
+        if (tick_delta_env != nullptr) {
+          const unsigned long parsed_delta = std::stoul(tick_delta_env);
+          if (parsed_delta == 0 ||
+              parsed_delta > std::numeric_limits<uint32_t>::max()) {
+            throw std::invalid_argument(
+                "SONIC_SIM_TICK_DELTA_PER_CONTROL must be in [1, UINT32_MAX]");
+          }
+          sim_tick_delta_per_control_ = static_cast<uint32_t>(parsed_delta);
+        }
+        std::cout << "[SIM] Synchronizing policy/reference updates to LowState.tick "
+                  << "(" << sim_tick_delta_per_control_
+                  << " tick units per 50 Hz control frame)" << std::endl;
+      }
+      sim_allow_idle_lowstate_gap_ =
+          std::getenv("SONIC_SIM_ALLOW_IDLE_LOWSTATE_GAP") != nullptr;
+      if (sim_allow_idle_lowstate_gap_) {
+        std::cout << "[SIM] Allowing LowState gaps only while reference playback "
+                     "is idle; active playback keeps strict DDS-loss safety"
+                  << std::endl;
+      }
+      const char* history_warmup_env =
+          std::getenv("SONIC_SIM_HISTORY_WARMUP_TICKS");
+      if (history_warmup_env != nullptr) {
+        const unsigned long parsed_ticks = std::stoul(history_warmup_env);
+        if (parsed_ticks > 1000) {
+          throw std::invalid_argument(
+              "SONIC_SIM_HISTORY_WARMUP_TICKS must be in [0, 1000]");
+        }
+        sim_history_warmup_ticks_ = static_cast<uint32_t>(parsed_ticks);
+        if (sim_history_warmup_ticks_ > 0) {
+          std::cout << "[SIM] Prefilling policy state history for "
+                    << sim_history_warmup_ticks_
+                    << " control ticks before the first inference" << std::endl;
+        }
+      }
+      const char* action_slew_env =
+          std::getenv("SONIC_SIM_ACTION_SLEW_RATE_RAD_S");
+      if (action_slew_env != nullptr) {
+        sim_action_slew_rate_rad_s_ = std::stod(action_slew_env);
+        if (!std::isfinite(sim_action_slew_rate_rad_s_) ||
+            sim_action_slew_rate_rad_s_ <= 0.0 ||
+            sim_action_slew_rate_rad_s_ > 100.0) {
+          throw std::invalid_argument(
+              "SONIC_SIM_ACTION_SLEW_RATE_RAD_S must be in (0, 100]");
+        }
+        const char* catchup_error_env =
+            std::getenv("SONIC_SIM_ACTION_SLEW_CATCHUP_ERROR_RAD");
+        if (catchup_error_env != nullptr) {
+          sim_action_slew_catchup_error_rad_ = std::stod(catchup_error_env);
+        }
+        if (!std::isfinite(sim_action_slew_catchup_error_rad_) ||
+            sim_action_slew_catchup_error_rad_ <= 0.0 ||
+            sim_action_slew_catchup_error_rad_ > 1.0) {
+          throw std::invalid_argument(
+              "SONIC_SIM_ACTION_SLEW_CATCHUP_ERROR_RAD must be in (0, 1]");
+        }
+        const char* catchup_ticks_env =
+            std::getenv("SONIC_SIM_ACTION_SLEW_CATCHUP_TICKS");
+        if (catchup_ticks_env != nullptr) {
+          const unsigned long parsed_ticks = std::stoul(catchup_ticks_env);
+          if (parsed_ticks == 0 || parsed_ticks > 1000) {
+            throw std::invalid_argument(
+                "SONIC_SIM_ACTION_SLEW_CATCHUP_TICKS must be in [1, 1000]");
+          }
+          sim_action_slew_catchup_ticks_ = static_cast<uint32_t>(parsed_ticks);
+        }
+        std::cout << "[SIM] Slewing policy actions inside SONIC at "
+                  << sim_action_slew_rate_rad_s_ << " rad/s until raw/applied "
+                  << "q targets remain within "
+                  << sim_action_slew_catchup_error_rad_ << " rad for "
+                  << sim_action_slew_catchup_ticks_ << " control ticks"
+                  << std::endl;
+      }
+      ChannelFactory::Instance()->Init(dds_domain, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -2260,7 +2375,8 @@ class G1Deploy {
       // create subscriber
       lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
-      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
+      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(TopicFromEnvironment(
+          "SONIC_SECONDARY_IMU_TOPIC", "rt/socialnav_sim/g1/secondary_imu")));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
@@ -2638,6 +2754,13 @@ class G1Deploy {
 
       low_state_buffer_.SetData(low_state);
 
+      // Legacy fallback for older simulator bridges. New Isaac integrations
+      // publish independent pelvis and torso IMUs, matching the official
+      // MuJoCo bridge, and must leave this option unset.
+      if (std::getenv("SONIC_SIM_IMU_FROM_LOWSTATE") != nullptr) {
+        imu_torso_buffer_.SetData(low_state.imu_state());
+      }
+
       // update mode machine
       if (mode_machine_ != low_state.mode_machine()) {
         if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
@@ -2662,6 +2785,18 @@ class G1Deploy {
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
+      // Simulation-only readiness marker. Unitree reserves these words and
+      // upstream consumers ignore them; the Isaac bridge uses the marker to
+      // keep root support enabled until SONIC's internally-shaped action has
+      // caught up. The marker is covered by the normal LowCmd CRC.
+      if (sim_action_slew_rate_rad_s_ > 0.0) {
+        dds_low_command.reserve().at(0) = 0x534f4e49;  // "SONI"
+        dds_low_command.reserve().at(1) =
+            sim_action_slew_ready_.load(std::memory_order_relaxed) ? 1u : 0u;
+        dds_low_command.reserve().at(2) =
+            sim_action_slew_active_.load(std::memory_order_relaxed) ? 1u : 0u;
+        dds_low_command.reserve().at(3) = 1u;  // marker schema version
+      }
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
       if (mc) {
@@ -2761,18 +2896,40 @@ class G1Deploy {
     }
 
     /// Check for valid LowState data and recent updates; if invalid, transition to ERROR state.
-    bool CheckSafety() {
+    bool CheckSafety(bool allow_idle_lowstate_gap = false) {
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       if (!ls) {
+        if (allow_idle_lowstate_gap) {
+          if (!sim_idle_lowstate_gap_active_) {
+            std::cout << "[SIM] LowState gap entered while playback is idle"
+                      << std::endl;
+            sim_idle_lowstate_gap_active_ = true;
+          }
+          return true;
+        }
         std::cout << "[ERROR] LowState data is not available in the middle of the control loop!" << std::endl;
         return false;
       }
 
       auto now = std::chrono::steady_clock::now();
       if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
+        if (allow_idle_lowstate_gap) {
+          if (!sim_idle_lowstate_gap_active_) {
+            std::cout << "[SIM] LowState gap entered while playback is idle"
+                      << std::endl;
+            sim_idle_lowstate_gap_active_ = true;
+          }
+          return true;
+        }
         std::cout << "[ERROR] Lost LowState data connection from robot!" << std::endl;
         return false;
+      }
+
+      if (sim_idle_lowstate_gap_active_) {
+        std::cout << "[SIM] LowState restored after idle simulator gap"
+                  << std::endl;
+        sim_idle_lowstate_gap_active_ = false;
       }
 
       return true;
@@ -3119,14 +3276,64 @@ class G1Deploy {
       float* floatarr = action_buffer.data();
       
       MotorCommand motor_command_tmp;
+      bool slew_caught_up = true;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
-        last_action[i] = static_cast<double>(floatarr[i]);
+        const int action_index = isaaclab_to_mujoco[i];
+        const double raw_action = static_cast<double>(floatarr[action_index]);
+        if (!std::isfinite(raw_action)) {
+          std::cerr << "✗ Error: Non-finite policy action at index "
+                    << action_index << std::endl;
+          return false;
+        }
+
+        double applied_action = raw_action;
+        if (sim_action_slew_active_.load(std::memory_order_relaxed)) {
+          const double action_scale = std::abs(g1_action_scale[i]);
+          if (action_scale <= std::numeric_limits<double>::epsilon()) {
+            std::cerr << "✗ Error: Invalid zero action scale at motor index "
+                      << i << std::endl;
+            return false;
+          }
+          const double max_action_delta =
+              sim_action_slew_rate_rad_s_ * control_dt_ / action_scale;
+          const double action_delta = std::clamp(
+              raw_action - sim_applied_action_[action_index],
+              -max_action_delta,
+              max_action_delta);
+          sim_applied_action_[action_index] += action_delta;
+          applied_action = sim_applied_action_[action_index];
+          const double remaining_q_target_error =
+              std::abs(raw_action - applied_action) * action_scale;
+          if (remaining_q_target_error > sim_action_slew_catchup_error_rad_) {
+            slew_caught_up = false;
+          }
+        } else {
+          sim_applied_action_[action_index] = raw_action;
+        }
+
+        const double action_value = applied_action * g1_action_scale[i];
+        // The policy observes a ten-frame last_actions history. Record the
+        // command that was actually sent, not the unclamped network output,
+        // so recurrent observations stay consistent with the simulated plant.
+        last_action[action_index] = applied_action;
         motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      if (sim_action_slew_active_.load(std::memory_order_relaxed)) {
+        if (slew_caught_up) {
+          ++sim_action_slew_caught_up_ticks_;
+        } else {
+          sim_action_slew_caught_up_ticks_ = 0;
+        }
+        if (sim_action_slew_caught_up_ticks_ >= sim_action_slew_catchup_ticks_) {
+          sim_action_slew_active_.store(false, std::memory_order_relaxed);
+          sim_action_slew_ready_.store(true, std::memory_order_release);
+          std::cout << "[SIM] Policy action slew caught up; using raw actions"
+                    << std::endl;
+        }
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3832,15 +4039,64 @@ class G1Deploy {
               warn_count++;
             }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
+            sim_history_warmup_remaining_ = sim_history_warmup_ticks_;
+            sim_applied_action_.fill(0.0);
+            last_action.fill(0.0);
+            sim_action_slew_caught_up_ticks_ = 0;
+            sim_action_slew_ready_.store(false, std::memory_order_relaxed);
+            sim_action_slew_active_.store(
+                sim_action_slew_rate_rad_s_ > 0.0,
+                std::memory_order_release);
             program_state_ = ProgramState::CONTROL;
           }
           break;
 
         case ProgramState::CONTROL: {
-          if (!CheckSafety()) {
+          if (!CheckSafety(
+                  sim_allow_idle_lowstate_gap_ && !operator_state.play)) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
             break;
+          }
+
+          // Isaac may render and simulate substantially slower than wall time.
+          // In that case the 50 Hz recurrent thread must not consume reference
+          // frames at 50 wall-clock Hz.  The simulator writes its physics-step
+          // counter or simulation time to LowState.tick. Run one policy/reference
+          // update after the configured tick delta. Isaac publishes a physics
+          // step counter (delta=4 at 200 Hz); official MuJoCo publishes
+          // milliseconds (delta=20 at 50 Hz). Physical-robot behavior is
+          // unchanged unless the explicit simulator-only flag is present.
+          if (sync_reference_to_sim_tick_) {
+            const auto low_state = low_state_buffer_.GetDataWithTime().data;
+            if (!low_state) {
+              break;
+            }
+            const uint32_t sim_tick = low_state->tick();
+            if (!sim_tick_initialized_) {
+              last_sim_control_tick_ = sim_tick;
+              sim_tick_initialized_ = true;
+            } else {
+              // A prewarmed Isaac runner uses a fresh physics-step counter.
+              // Distinguish a session reset from the natural uint32 wrap and
+              // rebase before consuming any reference frame. Without this,
+              // unsigned subtraction treats the reset as a huge elapsed span.
+              if (sim_tick < last_sim_control_tick_ &&
+                  last_sim_control_tick_ - sim_tick <
+                      (std::numeric_limits<uint32_t>::max() / 2U)) {
+                std::cout << "[SIM] LowState.tick reset detected; rebasing "
+                             "reference clock from "
+                          << last_sim_control_tick_ << " to " << sim_tick
+                          << std::endl;
+                last_sim_control_tick_ = sim_tick;
+                break;
+              }
+              const uint32_t elapsed_steps = sim_tick - last_sim_control_tick_;
+              if (elapsed_steps < sim_tick_delta_per_control_) {
+                break;
+              }
+              last_sim_control_tick_ += sim_tick_delta_per_control_;
+            }
           }
 
           // NEW: Get data with timestamps for loop timing analysis
@@ -3853,6 +4109,24 @@ class G1Deploy {
             operator_state.stop = true;
             std::cout << "Stopping control system." << std::endl;
             return;
+          }
+
+          // Simulation-only cold-start guard. StateLogger observations use a
+          // ten-frame history, but upstream normally starts CONTROL with that
+          // history padded by synthetic zeros. Populate every history channel
+          // (q, dq, base orientation/gravity and the still-zero last action)
+          // from the real neutral state before the first policy inference.
+          // The command writer continues publishing the stable INIT/default
+          // LowCmd during these ticks. Physical deployment is unchanged unless
+          // SONIC_SIM_HISTORY_WARMUP_TICKS is explicitly set.
+          if (sim_history_warmup_remaining_ > 0) {
+            --sim_history_warmup_remaining_;
+            if (sim_history_warmup_remaining_ == 0) {
+              std::cout << "[SIM] Policy state history prefill complete; "
+                           "starting inference"
+                        << std::endl;
+            }
+            break;
           }
 
           // Handle temperature report request (F key)
@@ -4468,4 +4742,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-
