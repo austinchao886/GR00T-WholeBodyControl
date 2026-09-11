@@ -12,8 +12,8 @@
  *
  * Switching is done via **keyboard shortcuts** typed into the terminal:
  *   '!' → Keyboard  |  '@' → Gamepad  |  '#' → ZMQ  |  '$' → ROS2
- * The process supervisor additionally uses two non-printing control bytes:
- *   FS (0x1c) → reference keyboard | GS (0x1d) → gamepad + planner
+ * The process supervisor additionally reserves two otherwise-unused keys:
+ *   '{' → reference keyboard | '}' → gamepad + planner
  *
  * The manager also handles several **global** controls that work regardless of
  * which interface is active:
@@ -93,12 +93,12 @@ class InterfaceManager : public InputInterface {
       while (ReadStdinChar(ch)) {
         bool is_manager_key = false;
         switch (ch) {
-          case '\x1c':
+          case '{':
             SetActiveInterface(ManagedType::KEYBOARD);
             std::cout << "[InterfaceManager] Runtime mode: REFERENCE" << std::endl;
             is_manager_key = true;
             break;
-          case '\x1d':
+          case '}':
             SetActiveInterface(ManagedType::GAMEPAD);
             gamepad_->RequestPlannerMode(true);
             std::cout << "[InterfaceManager] Runtime mode: JOYSTICK_PLANNER" << std::endl;
@@ -405,4 +405,3 @@ class InterfaceManager : public InputInterface {
 };
 
 #endif // INTERFACE_MANAGER_HPP
-
