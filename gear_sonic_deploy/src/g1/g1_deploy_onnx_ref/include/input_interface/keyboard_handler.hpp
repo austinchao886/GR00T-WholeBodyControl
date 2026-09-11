@@ -305,6 +305,7 @@ class SimpleKeyboard : public InputInterface {
             case 'T': play_motion = true; break; // Play motion to end
             case 'r':
             case 'R': motion_restart = true; break; // Restart motion
+            case 'D': motion_selection_deferred_ = true; break; // Begin atomic selection
             case 'U': motion_materialize = true; break; // Materialize indexed motion
             case ']': start_control = true; break; // Start control system
             case 'o':
@@ -385,7 +386,7 @@ class SimpleKeyboard : public InputInterface {
           motion_reader.current_motion_index_ =
               (motion_reader.current_motion_index_ - 1 + motion_reader.motions.size()) % motion_reader.motions.size();
           std::string motion_name;
-          {
+          if (!motion_selection_deferred_) {
             std::lock_guard<std::mutex> lock(current_motion_mutex);
             operator_state.play = false;
             current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);  // Update current motion directly
@@ -398,7 +399,7 @@ class SimpleKeyboard : public InputInterface {
       if (this->motion_next && !motion_reader.motions.empty()) {
           motion_reader.current_motion_index_ = (motion_reader.current_motion_index_ + 1) % motion_reader.motions.size();
           std::string motion_name;
-          {
+          if (!motion_selection_deferred_) {
             std::lock_guard<std::mutex> lock(current_motion_mutex);
             operator_state.play = false;
             current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);  // Update current motion directly
@@ -443,6 +444,7 @@ class SimpleKeyboard : public InputInterface {
             current_frame = 0;
             reinitialize_heading = true;
             motion_name = current_motion->name;
+            motion_selection_deferred_ = false;
           }
           std::cout << "Materialized motion "
                     << motion_reader.current_motion_index_ << " : "
@@ -714,6 +716,7 @@ class SimpleKeyboard : public InputInterface {
 
 
   private:
+    bool motion_selection_deferred_ = false;
     struct termios old_termios_;
 };
 
