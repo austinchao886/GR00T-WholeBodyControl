@@ -16,7 +16,8 @@
  *  - **Planner mode** (toggled with F1) – the left stick controls movement
  *    direction, the right stick controls facing direction, and the bumpers
  *    switch between locomotion modes (idle / slow walk / walk / run / squat /
- *    kneel).  L2/R2 adjust speed or height depending on the current mode.
+ *    kneel). F2 must be held as a locomotion deadman. L2/R2 adjust speed or
+ *    height depending on the current mode.
  *
  * See the button-mapping comment block inside the class for the complete mapping.
  */
@@ -30,6 +31,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include "input_interface.hpp"
 
 #ifndef M_PI
@@ -177,6 +179,25 @@ class Gamepad : public InputInterface {
       type_ = InputType::GAMEPAD;
     }
 
+    /**
+     * Request a planner mode change from the runtime supervisor.
+     *
+     * InterfaceManager performs a safety reset whenever it changes delegates.
+     * Applying this request in update(), after consuming that reset, prevents
+     * the reset from immediately cancelling the requested planner activation.
+     */
+    void RequestPlannerMode(bool enabled) {
+      if (enabled) {
+        lx = rx = ry = l2 = ly = 0.0f;
+        planner_facing_angle = 0.0;
+        planner_moving_direction = 0.0;
+        planner_use_movement_mode = 1;
+        planner_use_movement_speed = -1.0;
+        planner_use_height = -1.0;
+      }
+      requested_planner_mode_ = enabled;
+    }
+
     /*
      * Gamepad Button Mappings:
      * 
@@ -186,6 +207,7 @@ class Gamepad : public InputInterface {
      * - Start Button  - Start control
      * - Select Button - Emergency Stop (kills all motion)
      * - F1 Button - Toggle planner on/off
+     * - F2 Button - Planner locomotion deadman (must be held to move)
      * - D-pad L/R     - Delta heading left/right (+/-0.1 rad)
      * 
      * Non-Planner Mode:
@@ -210,6 +232,19 @@ class Gamepad : public InputInterface {
         use_planner = false;
         trigger_safety_reset = true;
         std::cout << "[Gamepad] Safety reset triggered: will disable planner and return to reference motion" << std::endl;
+      }
+
+      if (requested_planner_mode_.has_value()) {
+        use_planner = *requested_planner_mode_;
+        // A supervisor-requested planner activation deliberately follows the
+        // manager safety reset, so do not execute the reset's reference-mode
+        // fallback in handle_input().
+        if (use_planner) {
+          trigger_safety_reset = false;
+        }
+        requested_planner_mode_.reset();
+        std::cout << "[Gamepad] Runtime planner request: "
+                  << (use_planner ? "enabled" : "disabled") << std::endl;
       }
 
       // Reset input flags each frame
@@ -484,6 +519,11 @@ class Gamepad : public InputInterface {
       left.update(key_data.btn.components.left);
     }
 
+  private:
+    std::optional<bool> requested_planner_mode_;
+
+  public:
+
     // Override the handle_input function from InputInterface
     // This processes the gamepad input flags and performs actions using the provided parameters
     void handle_input(MotionDataReader& motion_reader,
@@ -688,8 +728,10 @@ class Gamepad : public InputInterface {
           double final_speed = this->planner_use_movement_speed;
           double final_height = this->planner_use_height;
 
-          // If left sticks are in the dead zone, idle mode
-          if (std::abs(lx) < dead_zone && std::abs(ly) < dead_zone) {
+          // F2 is the locomotion deadman. Releasing it (or losing a remote
+          // that reports zeroed buttons) commands idle instead of preserving
+          // stale movement intent.
+          if (!F2.pressed || (std::abs(lx) < dead_zone && std::abs(ly) < dead_zone)) {
             if constexpr (DEBUG_LOGGING) {
               std::cout << "Both left sticks in the dead zone - Idle mode" << std::endl;
               std::cout << "[GAMEPAD DEBUG] Left stick: lx=" << lx << ", ly=" << ly << std::endl;
