@@ -121,9 +121,25 @@ class InterfaceManager : public InputInterface {
       // a long-lived pseudo-terminal.
       const auto runtime_request = sonic_runtime_control::ConsumeRequest();
       if (runtime_request == sonic_runtime_control::REFERENCE) {
-        SetActiveInterface(ManagedType::KEYBOARD);
-        std::cout << "[InterfaceManager] Runtime mode: REFERENCE" << std::endl;
+        if (active_ == ManagedType::GAMEPAD && !runtime_reference_standby_) {
+          // First phase: remain on the gamepad delegate long enough for its
+          // normal planner-disable path to return to the indexed neutral
+          // reference. The supervisor waits for physical stability before it
+          // requests the second phase.
+          gamepad_->RequestPlannerMode(false);
+          runtime_reference_standby_ = true;
+          std::cout << "[InterfaceManager] Runtime mode: REFERENCE_STANDBY" << std::endl;
+        } else {
+          // Second phase: the robot is already neutral and the gamepad planner
+          // is disabled. Switching delegates must not trigger another safety
+          // reset, which would replace the stable reference with a temporary
+          // planner snapshot and create a discontinuous policy target.
+          SetActiveInterfaceWithoutSafetyReset(ManagedType::KEYBOARD);
+          runtime_reference_standby_ = false;
+          std::cout << "[InterfaceManager] Runtime mode: REFERENCE" << std::endl;
+        }
       } else if (runtime_request == sonic_runtime_control::JOYSTICK_PLANNER) {
+        runtime_reference_standby_ = false;
         SetActiveInterface(ManagedType::GAMEPAD);
         gamepad_->RequestPlannerMode(true);
         std::cout << "[InterfaceManager] Runtime mode: JOYSTICK_PLANNER" << std::endl;
@@ -335,9 +351,25 @@ class InterfaceManager : public InputInterface {
       }
     }
 
+    /// Runtime-only delegate switch after an externally verified neutral gate.
+    void SetActiveInterfaceWithoutSafetyReset(ManagedType t) {
+      for (size_t i = 0; i < order_.size(); ++i) {
+        if (order_[i] != t) { continue; }
+        active_index_ = static_cast<int>(i);
+        active_ = t;
+        if (t == ManagedType::KEYBOARD) {
+          current_ = keyboard_.get();
+          type_ = InputType::KEYBOARD;
+          std::cout << "[InterfaceManager] Switched to: KEYBOARD (neutral runtime gate)" << std::endl;
+        }
+        return;
+      }
+    }
+
     ManagedType GetActiveInterface() const { return active_; }
 
   private:
+    bool runtime_reference_standby_ = false;
     /// Instantiate all concrete interfaces and register them in order_.
     void buildInterfaces() {
       keyboard_ = std::make_unique<SimpleKeyboard>();
