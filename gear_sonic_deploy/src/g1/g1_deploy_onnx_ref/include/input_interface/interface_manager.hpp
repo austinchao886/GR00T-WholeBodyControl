@@ -34,6 +34,7 @@
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
+#include <csignal>
 
 #include "input_interface.hpp"
 #include "keyboard_handler.hpp"
@@ -43,6 +44,32 @@
 #if HAS_ROS2
 #include "ros2_input_handler.hpp"
 #endif
+
+namespace sonic_runtime_control {
+  enum RuntimeModeRequest : std::sig_atomic_t {
+    NONE = 0,
+    REFERENCE = 1,
+    JOYSTICK_PLANNER = 2,
+  };
+
+  // sig_atomic_t is intentionally used here: the signal handler may only set
+  // a small flag. The 100 Hz input thread performs the actual mode switch.
+  inline volatile std::sig_atomic_t requested_mode = NONE;
+
+  inline void HandleSignal(int signal_number) {
+    if (signal_number == SIGUSR1) {
+      requested_mode = REFERENCE;
+    } else if (signal_number == SIGUSR2) {
+      requested_mode = JOYSTICK_PLANNER;
+    }
+  }
+
+  inline RuntimeModeRequest ConsumeRequest() {
+    const auto request = static_cast<RuntimeModeRequest>(requested_mode);
+    requested_mode = NONE;
+    return request;
+  }
+}
 
 /**
  * @class InterfaceManager
@@ -87,6 +114,20 @@ class InterfaceManager : public InputInterface {
       // Reset per-frame flags
       emergency_stop_ = false;
       report_temperature_flag_ = false;
+
+      // The process supervisor uses signals for deterministic control-plane
+      // mode changes. Keyboard shortcuts remain available for an operator,
+      // but are not reliable enough for automated safety transitions through
+      // a long-lived pseudo-terminal.
+      const auto runtime_request = sonic_runtime_control::ConsumeRequest();
+      if (runtime_request == sonic_runtime_control::REFERENCE) {
+        SetActiveInterface(ManagedType::KEYBOARD);
+        std::cout << "[InterfaceManager] Runtime mode: REFERENCE" << std::endl;
+      } else if (runtime_request == sonic_runtime_control::JOYSTICK_PLANNER) {
+        SetActiveInterface(ManagedType::GAMEPAD);
+        gamepad_->RequestPlannerMode(true);
+        std::cout << "[InterfaceManager] Runtime mode: JOYSTICK_PLANNER" << std::endl;
+      }
       
       // Read stdin using shared buffering mechanism, check for manager keys
       char ch;

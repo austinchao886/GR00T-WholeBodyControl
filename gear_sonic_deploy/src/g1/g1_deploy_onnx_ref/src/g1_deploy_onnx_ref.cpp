@@ -4369,6 +4369,8 @@ class G1Deploy {
  */
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
+  std::signal(SIGUSR1, sonic_runtime_control::HandleSignal);
+  std::signal(SIGUSR2, sonic_runtime_control::HandleSignal);
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
               << std::endl;
