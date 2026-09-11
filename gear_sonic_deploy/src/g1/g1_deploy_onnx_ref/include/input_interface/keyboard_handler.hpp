@@ -70,6 +70,7 @@ class SimpleKeyboard : public InputInterface {
     bool motion_next = false;      ///< Switch to next pre-loaded motion.
     bool play_motion = false;      ///< Start / resume motion playback.
     bool motion_restart = false;   ///< Reset current motion to frame 0 (paused).
+    bool motion_materialize = false; ///< Replace a temporary snapshot with indexed motion.
 
     bool start_control = false;    ///< Request control-system start.
     bool stop_control = false;     ///< Request emergency stop.
@@ -157,6 +158,7 @@ class SimpleKeyboard : public InputInterface {
       motion_next = false;
       play_motion = false;
       motion_restart = false;
+      motion_materialize = false;
       delta_left = false;
       delta_right = false;
       reinitialize = false;
@@ -303,6 +305,7 @@ class SimpleKeyboard : public InputInterface {
             case 'T': play_motion = true; break; // Play motion to end
             case 'r':
             case 'R': motion_restart = true; break; // Restart motion
+            case 'U': motion_materialize = true; break; // Materialize indexed motion
             case ']': start_control = true; break; // Start control system
             case 'o':
             case 'O': stop_control = true; break; // Stop/Exit
@@ -428,6 +431,22 @@ class SimpleKeyboard : public InputInterface {
             reinitialize_heading = true;
           }
           std::cout << "Reset motion " << motion_reader.current_motion_index_ << " to frame 0 (paused)" << std::endl;
+      }
+
+      if (this->motion_materialize && !motion_reader.motions.empty()) {
+          std::string motion_name;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = false;
+            current_motion = motion_reader.GetMotionShared(
+                motion_reader.current_motion_index_);
+            current_frame = 0;
+            reinitialize_heading = true;
+            motion_name = current_motion->name;
+          }
+          std::cout << "Materialized motion "
+                    << motion_reader.current_motion_index_ << " : "
+                    << motion_name << " at frame 0 (paused)" << std::endl;
       }
 
       if (this->stop_control) { operator_state.stop = true; }
