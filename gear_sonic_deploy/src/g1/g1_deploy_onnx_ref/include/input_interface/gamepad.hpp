@@ -235,16 +235,17 @@ class Gamepad : public InputInterface {
       }
 
       if (requested_planner_mode_.has_value()) {
-        use_planner = *requested_planner_mode_;
-        // A supervisor-requested planner activation deliberately follows the
-        // manager safety reset, so do not execute the reset's reference-mode
-        // fallback in handle_input().
-        if (use_planner) {
+        runtime_joystick_armed_ = *requested_planner_mode_;
+        // Joystick runtime enters in neutral-reference standby. The planner
+        // is activated only while the F2 deadman is held, preventing a
+        // generative idle trajectory from replacing a stable stand.
+        use_planner = false;
+        if (runtime_joystick_armed_) {
           trigger_safety_reset = false;
         }
         requested_planner_mode_.reset();
-        std::cout << "[Gamepad] Runtime planner request: "
-                  << (use_planner ? "enabled" : "disabled") << std::endl;
+        std::cout << "[Gamepad] Runtime joystick standby: "
+                  << (runtime_joystick_armed_ ? "ready" : "disabled") << std::endl;
       }
 
       // Reset input flags each frame
@@ -261,6 +262,15 @@ class Gamepad : public InputInterface {
 
       // Process gamepad input and set flags based on current button states
       update_gamepad_data(gamepad_data.RF_RX);
+
+      if (runtime_joystick_armed_) {
+        const bool deadman_planner_requested = F2.pressed;
+        if (deadman_planner_requested != use_planner) {
+          use_planner = deadman_planner_requested;
+          std::cout << "[Gamepad] F2 deadman planner: "
+                    << (use_planner ? "enabled" : "disabled") << std::endl;
+        }
+      }
 
       // Debug: Log analog stick values if they're above dead zone
       if constexpr (DEBUG_LOGGING) {
@@ -451,7 +461,7 @@ class Gamepad : public InputInterface {
 
 
       // F1 - Toggle planner
-      if (F1.on_press) { 
+      if (!runtime_joystick_armed_ && F1.on_press) {
         use_planner = !use_planner; 
         if constexpr (DEBUG_LOGGING) {
           std::cout << "[GAMEPAD DEBUG] F1 pressed - Planner toggled to: " << (use_planner ? "ON" : "OFF") << std::endl;
@@ -521,6 +531,7 @@ class Gamepad : public InputInterface {
 
   private:
     std::optional<bool> requested_planner_mode_;
+    bool runtime_joystick_armed_ = false;
 
   public:
 
