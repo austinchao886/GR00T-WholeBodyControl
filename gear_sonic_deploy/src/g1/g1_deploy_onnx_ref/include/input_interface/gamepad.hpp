@@ -25,6 +25,7 @@
 #ifndef GAMEPAD_HPP
 #define GAMEPAD_HPP
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <array>
@@ -738,6 +739,28 @@ class Gamepad : public InputInterface {
           std::array<double, 3> final_facing_direction = {double(cos(planner_facing_angle)), double(sin(planner_facing_angle)), 0.0};
           double final_speed = this->planner_use_movement_speed;
           double final_height = this->planner_use_height;
+
+          // Runtime joystick locomotion uses the radial stick magnitude as a
+          // continuous slow-walk speed request.  The previous implementation
+          // used the stick only as an on/off gate, so crossing the dead zone
+          // immediately selected a fixed speed.  A squared response curve
+          // preserves fine control near center while still reaching the
+          // planner's validated 0.2-0.8 m/s slow-walk range at full deflection.
+          const double stick_magnitude = std::min(
+              1.0, std::hypot(static_cast<double>(lx), static_cast<double>(ly)));
+          if (runtime_joystick_armed_ && F2.pressed &&
+              planner_use_movement_mode == static_cast<int>(LocomotionMode::SLOW_WALK) &&
+              stick_magnitude >= dead_zone) {
+            const double normalized_magnitude = std::clamp(
+                (stick_magnitude - static_cast<double>(dead_zone)) /
+                    (1.0 - static_cast<double>(dead_zone)),
+                0.0, 1.0);
+            const double shaped_magnitude = normalized_magnitude * normalized_magnitude;
+            constexpr double kSlowWalkMinSpeed = 0.2;
+            constexpr double kSlowWalkMaxSpeed = 0.8;
+            final_speed = kSlowWalkMinSpeed +
+                (kSlowWalkMaxSpeed - kSlowWalkMinSpeed) * shaped_magnitude;
+          }
 
           // F2 is the locomotion deadman. Releasing it (or losing a remote
           // that reports zeroed buttons) commands idle instead of preserving
