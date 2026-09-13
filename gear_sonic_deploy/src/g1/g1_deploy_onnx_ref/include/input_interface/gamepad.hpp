@@ -188,6 +188,7 @@ class Gamepad : public InputInterface {
      * the reset from immediately cancelling the requested planner activation.
      */
     void RequestPlannerMode(bool enabled) {
+      runtime_reference_hold_ = false;
       runtime_commanded_speed_ = 0.0;
       runtime_turn_rate_ = 0.0;
       runtime_deadman_active_ = false;
@@ -200,6 +201,13 @@ class Gamepad : public InputInterface {
         planner_use_height = -1.0;
       }
       requested_planner_mode_ = enabled;
+    }
+
+    // Freeze motion intent while retaining the live planner and its current
+    // facing anchor. The supervisor qualifies physical rest before disabling
+    // the planner; fresh remote packets cannot override this hold.
+    void RequestPlannerHold() {
+      runtime_reference_hold_ = true;
     }
 
     /*
@@ -267,6 +275,20 @@ class Gamepad : public InputInterface {
 
       // Process gamepad input and set flags based on current button states
       update_gamepad_data(gamepad_data.RF_RX);
+
+      if (runtime_reference_hold_) {
+        lx = ly = rx = ry = l2 = 0.0f;
+        runtime_commanded_speed_ = 0.0;
+        runtime_turn_rate_ = 0.0;
+        planner_use_movement_mode = static_cast<int>(LocomotionMode::IDLE);
+        planner_use_movement_speed = -1.0;
+        planner_use_height = -1.0;
+        // Keep emergency controls live, but suppress play, mode toggles and
+        // heading reinitialization while the supervisor owns preemption.
+        planner_emergency_stop = B.pressed;
+        stop_control = select.pressed;
+        return;
+      }
 
       if (runtime_joystick_armed_) {
         const bool deadman_active = F2.pressed;
@@ -447,7 +469,9 @@ class Gamepad : public InputInterface {
             // The legacy update was -0.02*rx every 50 Hz tick, equivalent to
             // a 1.0 rad/s maximum yaw rate. Limit runtime teleoperation to
             // 0.3 rad/s and slew the rate to avoid abrupt facing changes.
-            constexpr double kControlDt = 0.02;
+            // G1Deploy::Input polls at 100 Hz, independently of the 50 Hz
+            // policy loop. Using policy dt here doubles the requested yaw.
+            constexpr double kControlDt = 0.01;
             constexpr double kMaxYawRate = 0.3;
             constexpr double kMaxYawAcceleration = 1.0;
             const double target_turn_rate =
@@ -894,6 +918,7 @@ class Gamepad : public InputInterface {
     double runtime_commanded_speed_ = 0.0;
     double runtime_turn_rate_ = 0.0;
     bool runtime_deadman_active_ = false;
+    bool runtime_reference_hold_ = false;
 
     // ------------------------------------------------------------------
     // Edge-detecting button states

@@ -121,7 +121,11 @@ class InterfaceManager : public InputInterface {
       // a long-lived pseudo-terminal.
       const auto runtime_request = sonic_runtime_control::ConsumeRequest();
       if (runtime_request == sonic_runtime_control::REFERENCE) {
-        if (active_ == ManagedType::GAMEPAD && !runtime_reference_standby_) {
+        if (active_ == ManagedType::GAMEPAD && !runtime_reference_hold_) {
+          gamepad_->RequestPlannerHold();
+          runtime_reference_hold_ = true;
+          std::cout << "[InterfaceManager] Runtime mode: PLANNER_HOLD" << std::endl;
+        } else if (active_ == ManagedType::GAMEPAD && !runtime_reference_standby_) {
           // First phase: remain on the gamepad delegate long enough for its
           // normal planner-disable path to return to the indexed neutral
           // reference. The supervisor waits for physical stability before it
@@ -136,10 +140,12 @@ class InterfaceManager : public InputInterface {
           // planner snapshot and create a discontinuous policy target.
           SetActiveInterfaceWithoutSafetyReset(ManagedType::KEYBOARD);
           runtime_reference_standby_ = false;
+          runtime_reference_hold_ = false;
           std::cout << "[InterfaceManager] Runtime mode: REFERENCE" << std::endl;
         }
       } else if (runtime_request == sonic_runtime_control::JOYSTICK_PLANNER) {
         runtime_reference_standby_ = false;
+        runtime_reference_hold_ = false;
         SetActiveInterface(ManagedType::GAMEPAD);
         gamepad_->RequestPlannerMode(true);
         std::cout << "[InterfaceManager] Runtime mode: JOYSTICK_PLANNER" << std::endl;
@@ -369,6 +375,7 @@ class InterfaceManager : public InputInterface {
     ManagedType GetActiveInterface() const { return active_; }
 
   private:
+    bool runtime_reference_hold_ = false;
     bool runtime_reference_standby_ = false;
     /// Instantiate all concrete interfaces and register them in order_.
     void buildInterfaces() {
