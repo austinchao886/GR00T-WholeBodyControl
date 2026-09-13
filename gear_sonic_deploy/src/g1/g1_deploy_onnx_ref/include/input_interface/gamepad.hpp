@@ -188,6 +188,8 @@ class Gamepad : public InputInterface {
      * the reset from immediately cancelling the requested planner activation.
      */
     void RequestPlannerMode(bool enabled) {
+      runtime_commanded_speed_ = 0.0;
+      runtime_turn_rate_ = 0.0;
       if (enabled) {
         lx = rx = ry = l2 = ly = 0.0f;
         planner_facing_angle = 0.0;
@@ -268,6 +270,13 @@ class Gamepad : public InputInterface {
         const bool deadman_planner_requested = F2.pressed;
         if (deadman_planner_requested != use_planner) {
           use_planner = deadman_planner_requested;
+          if (!deadman_planner_requested) {
+            // Releasing the deadman remains an immediate safety stop. Smooth
+            // deceleration applies only while F2 stays held and the operator
+            // returns the left stick to center.
+            runtime_commanded_speed_ = 0.0;
+            runtime_turn_rate_ = 0.0;
+          }
           std::cout << "[Gamepad] F2 deadman planner: "
                     << (use_planner ? "enabled" : "disabled") << std::endl;
         }
@@ -430,8 +439,28 @@ class Gamepad : public InputInterface {
         }
         // Analog sticks - change movement and facing direction (with dead zone)
         
-        if (std::abs(rx) > dead_zone || std::abs(ry) > dead_zone) {
+        if (runtime_joystick_armed_) {
+            // The legacy update was -0.02*rx every 50 Hz tick, equivalent to
+            // a 1.0 rad/s maximum yaw rate. Limit runtime teleoperation to
+            // 0.3 rad/s and slew the rate to avoid abrupt facing changes.
+            constexpr double kControlDt = 0.02;
+            constexpr double kMaxYawRate = 0.3;
+            constexpr double kMaxYawAcceleration = 1.0;
+            const double target_turn_rate =
+                std::abs(rx) > dead_zone ? -kMaxYawRate * rx : 0.0;
+            const double max_turn_delta = kMaxYawAcceleration * kControlDt;
+            runtime_turn_rate_ += std::clamp(
+                target_turn_rate - runtime_turn_rate_,
+                -max_turn_delta,
+                max_turn_delta);
+            if (target_turn_rate == 0.0 && std::abs(runtime_turn_rate_) < 1e-3) {
+              runtime_turn_rate_ = 0.0;
+            }
+            planner_facing_angle += runtime_turn_rate_ * kControlDt;
+        } else if (std::abs(rx) > dead_zone || std::abs(ry) > dead_zone) {
             planner_facing_angle = planner_facing_angle - 0.02 * rx;
+        }
+        if (std::abs(runtime_joystick_armed_ ? runtime_turn_rate_ : rx) > 0.0) {
             if constexpr (DEBUG_LOGGING) {
               {
                 std::cout << "[GAMEPAD DEBUG] Right stick - Facing angle: " << planner_facing_angle << " rad ("
@@ -741,31 +770,59 @@ class Gamepad : public InputInterface {
           double final_height = this->planner_use_height;
 
           // Runtime joystick locomotion uses the radial stick magnitude as a
-          // continuous slow-walk speed request.  The previous implementation
+          // continuous slow-walk speed request. The previous implementation
           // used the stick only as an on/off gate, so crossing the dead zone
-          // immediately selected a fixed speed.  A squared response curve
+          // immediately selected a fixed speed. A squared response curve
           // preserves fine control near center while still reaching the
-          // planner's validated 0.2-0.8 m/s slow-walk range at full deflection.
+          // conservative 0.2-0.45 m/s simulation range at full deflection.
           const double stick_magnitude = std::min(
               1.0, std::hypot(static_cast<double>(lx), static_cast<double>(ly)));
           if (runtime_joystick_armed_ && F2.pressed &&
-              planner_use_movement_mode == static_cast<int>(LocomotionMode::SLOW_WALK) &&
-              stick_magnitude >= dead_zone) {
-            const double normalized_magnitude = std::clamp(
-                (stick_magnitude - static_cast<double>(dead_zone)) /
-                    (1.0 - static_cast<double>(dead_zone)),
-                0.0, 1.0);
-            const double shaped_magnitude = normalized_magnitude * normalized_magnitude;
+              planner_use_movement_mode == static_cast<int>(LocomotionMode::SLOW_WALK)) {
             constexpr double kSlowWalkMinSpeed = 0.2;
-            constexpr double kSlowWalkMaxSpeed = 0.8;
-            final_speed = kSlowWalkMinSpeed +
-                (kSlowWalkMaxSpeed - kSlowWalkMinSpeed) * shaped_magnitude;
+            constexpr double kSlowWalkMaxSpeed = 0.45;
+            constexpr double kAccelerationPerTick = 0.01;
+            constexpr double kDecelerationPerTick = 0.015;
+            double target_speed = 0.0;
+            if (stick_magnitude >= dead_zone) {
+              const double normalized_magnitude = std::clamp(
+                  (stick_magnitude - static_cast<double>(dead_zone)) /
+                      (1.0 - static_cast<double>(dead_zone)),
+                  0.0, 1.0);
+              const double shaped_magnitude =
+                  normalized_magnitude * normalized_magnitude;
+              target_speed = kSlowWalkMinSpeed +
+                  (kSlowWalkMaxSpeed - kSlowWalkMinSpeed) * shaped_magnitude;
+            }
+            const double speed_delta = target_speed - runtime_commanded_speed_;
+            runtime_commanded_speed_ += std::clamp(
+                speed_delta, -kDecelerationPerTick, kAccelerationPerTick);
+            runtime_commanded_speed_ = std::clamp(
+                runtime_commanded_speed_, 0.0, kSlowWalkMaxSpeed);
+
+            if (stick_magnitude >= dead_zone ||
+                runtime_commanded_speed_ > kSlowWalkMinSpeed + 1e-3) {
+              // Turning consumes part of the gait's stability margin. At the
+              // maximum yaw rate, cap translation to half of its request.
+              constexpr double kMaxYawRate = 0.3;
+              const double turn_ratio = std::clamp(
+                  std::abs(runtime_turn_rate_) / kMaxYawRate, 0.0, 1.0);
+              const double turn_speed_scale = 1.0 - 0.5 * turn_ratio;
+              final_speed = std::max(
+                  kSlowWalkMinSpeed,
+                  runtime_commanded_speed_ * turn_speed_scale);
+            }
           }
 
           // F2 is the locomotion deadman. Releasing it (or losing a remote
           // that reports zeroed buttons) commands idle instead of preserving
           // stale movement intent.
-          if (!F2.pressed || (std::abs(lx) < dead_zone && std::abs(ly) < dead_zone)) {
+          const bool smooth_stop_complete =
+              runtime_joystick_armed_ && F2.pressed &&
+              stick_magnitude < dead_zone && runtime_commanded_speed_ <= 0.201;
+          if (!F2.pressed ||
+              ((std::abs(lx) < dead_zone && std::abs(ly) < dead_zone) &&
+               (!runtime_joystick_armed_ || smooth_stop_complete))) {
             if constexpr (DEBUG_LOGGING) {
               std::cout << "Both left sticks in the dead zone - Idle mode" << std::endl;
               std::cout << "[GAMEPAD DEBUG] Left stick: lx=" << lx << ", ly=" << ly << std::endl;
@@ -827,6 +884,11 @@ class Gamepad : public InputInterface {
 
     float smooth = 0.3f;       ///< EMA smoothing factor (0 = no update, 1 = no smoothing).
     float dead_zone = 0.05f;   ///< Analog values below this are zeroed.
+
+    // Runtime-only command shaping. These states are cleared immediately when
+    // the F2 deadman is released or the supervisor changes planner mode.
+    double runtime_commanded_speed_ = 0.0;
+    double runtime_turn_rate_ = 0.0;
 
     // ------------------------------------------------------------------
     // Edge-detecting button states
