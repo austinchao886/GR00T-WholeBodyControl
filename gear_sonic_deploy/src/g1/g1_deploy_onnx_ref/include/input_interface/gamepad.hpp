@@ -190,6 +190,7 @@ class Gamepad : public InputInterface {
     void RequestPlannerMode(bool enabled) {
       runtime_commanded_speed_ = 0.0;
       runtime_turn_rate_ = 0.0;
+      runtime_deadman_active_ = false;
       if (enabled) {
         lx = rx = ry = l2 = ly = 0.0f;
         planner_facing_angle = 0.0;
@@ -239,10 +240,11 @@ class Gamepad : public InputInterface {
 
       if (requested_planner_mode_.has_value()) {
         runtime_joystick_armed_ = *requested_planner_mode_;
-        // Joystick runtime enters in neutral-reference standby. The planner
-        // is activated only while the F2 deadman is held, preventing a
-        // generative idle trajectory from replacing a stable stand.
-        use_planner = false;
+        // Keep the whole-body planner alive for the complete interactive
+        // session. F2 controls locomotion intent, not controller ownership;
+        // disabling the planner on every deadman release creates a hard
+        // planner-to-reference transition and a large body jerk.
+        use_planner = runtime_joystick_armed_;
         if (runtime_joystick_armed_) {
           trigger_safety_reset = false;
         }
@@ -267,18 +269,20 @@ class Gamepad : public InputInterface {
       update_gamepad_data(gamepad_data.RF_RX);
 
       if (runtime_joystick_armed_) {
-        const bool deadman_planner_requested = F2.pressed;
-        if (deadman_planner_requested != use_planner) {
-          use_planner = deadman_planner_requested;
-          if (!deadman_planner_requested) {
-            // Releasing the deadman remains an immediate safety stop. Smooth
-            // deceleration applies only while F2 stays held and the operator
-            // returns the left stick to center.
+        const bool deadman_active = F2.pressed;
+        if (deadman_active != runtime_deadman_active_) {
+          runtime_deadman_active_ = deadman_active;
+          if (!deadman_active) {
+            // Releasing F2 immediately clears locomotion intent, while the
+            // planner remains active in IDLE to keep balancing the robot.
+            // Smooth deceleration applies only when F2 remains held and the
+            // operator deliberately returns the stick to center.
             runtime_commanded_speed_ = 0.0;
             runtime_turn_rate_ = 0.0;
           }
-          std::cout << "[Gamepad] F2 deadman planner: "
-                    << (use_planner ? "enabled" : "disabled") << std::endl;
+          std::cout << "[Gamepad] F2 locomotion: "
+                    << (deadman_active ? "enabled" : "immediate IDLE")
+                    << "; planner remains active" << std::endl;
         }
       }
 
@@ -889,6 +893,7 @@ class Gamepad : public InputInterface {
     // the F2 deadman is released or the supervisor changes planner mode.
     double runtime_commanded_speed_ = 0.0;
     double runtime_turn_rate_ = 0.0;
+    bool runtime_deadman_active_ = false;
 
     // ------------------------------------------------------------------
     // Edge-detecting button states
