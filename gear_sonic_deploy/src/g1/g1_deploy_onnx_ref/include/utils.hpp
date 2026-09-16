@@ -15,6 +15,7 @@
 #define UTILS_HPP
 
 #include <memory>
+#include <mutex>
 #include <chrono>
 #include <shared_mutex>
 #include <cstdint>
