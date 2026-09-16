@@ -805,6 +805,10 @@ class Gamepad : public InputInterface {
           // conservative 0.2-0.45 m/s simulation range at full deflection.
           const double stick_magnitude = std::min(
               1.0, std::hypot(static_cast<double>(lx), static_cast<double>(ly)));
+          // Candidate05's sub-floor stop did not improve full-trial tilt.
+          // Retain solely as an explicit experiment; default stays pre-experiment behavior.
+          const char* zero_stop_flag = std::getenv("SONIC_EXPERIMENTAL_ZERO_SPEED_DECEL");
+          const bool zero_speed_stop = zero_stop_flag && std::string(zero_stop_flag)=="1";
           if (runtime_joystick_armed_ && F2.pressed &&
               planner_use_movement_mode == static_cast<int>(LocomotionMode::SLOW_WALK)) {
             constexpr double kSlowWalkMinSpeed = 0.2;
@@ -829,7 +833,7 @@ class Gamepad : public InputInterface {
                 runtime_commanded_speed_, 0.0, kSlowWalkMaxSpeed);
 
             if (stick_magnitude >= dead_zone ||
-                runtime_commanded_speed_ > kSlowWalkMinSpeed + 1e-3) {
+                (!zero_speed_stop && runtime_commanded_speed_ > kSlowWalkMinSpeed + 1e-3)) {
               // Turning consumes part of the gait's stability margin. At the
               // maximum yaw rate, cap translation to half of its request.
               constexpr double kMaxYawRate = 0.3;
@@ -839,6 +843,12 @@ class Gamepad : public InputInterface {
               final_speed = std::max(
                   kSlowWalkMinSpeed,
                   runtime_commanded_speed_ * turn_speed_scale);
+            } else if (zero_speed_stop) {
+              // Intentional centering with deadman held is a deceleration,
+              // not an immediate mode switch at the walking-speed floor.
+              // Preserve direction and SLOW_WALK while the existing slew
+              // reaches zero. Explicit deadman release still overrides below.
+              final_speed = runtime_commanded_speed_;
             }
           }
 
@@ -847,7 +857,7 @@ class Gamepad : public InputInterface {
           // stale movement intent.
           const bool smooth_stop_complete =
               runtime_joystick_armed_ && F2.pressed &&
-              stick_magnitude < dead_zone && runtime_commanded_speed_ <= 0.201;
+              stick_magnitude < dead_zone && runtime_commanded_speed_ <= (zero_speed_stop ? 1e-6 : .201);
           if (!F2.pressed ||
               ((std::abs(lx) < dead_zone && std::abs(ly) < dead_zone) &&
                (!runtime_joystick_armed_ || smooth_stop_complete))) {
