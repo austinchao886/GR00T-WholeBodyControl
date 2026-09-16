@@ -113,6 +113,7 @@
 #include "../include/input_interface/interface_manager.hpp"
 #include "../include/input_interface/gamepad_manager.hpp"
 #include "../include/input_interface/zmq_manager.hpp"
+#include "../include/gesture_receiver.hpp"
 
 // Output interface and output handlers
 #include "../include/output_interface/output_interface.hpp"
@@ -218,6 +219,8 @@ class G1Deploy {
     std::array<double, 7> left_hand_joint_buffer_;
     std::array<double, 7> right_hand_joint_buffer_;
     bool has_upper_body_data_ = false;
+    std::shared_ptr<const sonic_gesture::GestureSnapshot> gesture_snapshot_;
+    std::unique_ptr<sonic_gesture::GestureReceiver> gesture_receiver_;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
     std::vector<double> token_state_data_;  // Token buffer (size from config)
@@ -749,6 +752,28 @@ class G1Deploy {
       return true;
     }
 
+    bool ComposeGestureFrame(int target_frame, int future_offset,
+                             sonic_gesture::JointReference& result) {
+      if (!gesture_snapshot_ || !operator_state.play || current_motion_ != planner_motion_ ||
+          current_motion_->GetEncodeMode() != 0 || has_upper_body_data_ ||
+          current_motion_->GetNumJoints() != 29 || future_offset < 0 ||
+          future_offset > 45) {
+        std::cerr << "[Gesture] Incompatible planner reference window" << std::endl;
+        return false;
+      }
+      sonic_gesture::JointReference base;
+      std::copy_n(current_motion_->JointPositions(target_frame),29,base.q.begin());
+      std::copy_n(current_motion_->JointVelocities(target_frame),29,base.dq.begin());
+      try {
+        result = sonic_gesture::Compose(base,sonic_gesture::SampleAt(
+            *gesture_snapshot_,last_sim_control_tick_,future_offset));
+      } catch (const std::exception& error) {
+        std::cerr << "[Gesture] Rejected reference: " << error.what() << std::endl;
+        return false;
+      }
+      return true;
+    }
+
     /// Gather joint positions from N future frames.  If joint_indexes is empty, gathers all 29.
     /// When upper-body control is active (has_upper_body_data_), replaces upper-body joints with
     /// the externally-provided targets.
@@ -784,7 +809,12 @@ class G1Deploy {
           }
         }
 
-        const auto motion_joint_pos = current_motion_->JointPositions(target_frame);
+        const double* motion_joint_pos = current_motion_->JointPositions(target_frame);
+        sonic_gesture::JointReference composed_position;
+        if (gesture_snapshot_) {
+          if (!ComposeGestureFrame(target_frame,frame_idx*step_size,composed_position)) return false;
+          motion_joint_pos = composed_position.q.data();
+        }
 
         // If body part indexes are empty, gather all joints
         if (joint_indexes.empty()) {
@@ -861,7 +891,12 @@ class G1Deploy {
           target_frame = static_cast<int>(current_motion_->timesteps) - 1;
         }
         
-        const auto motion_joint_vel = current_motion_->JointVelocities(target_frame);
+        const double* motion_joint_vel = current_motion_->JointVelocities(target_frame);
+        sonic_gesture::JointReference composed_velocity;
+        if (gesture_snapshot_) {
+          if (!ComposeGestureFrame(target_frame,frame_idx*step_size,composed_velocity)) return false;
+          motion_joint_vel = composed_velocity.dq.data();
+        }
 
         // If body part indexes are empty, gather all joints
         if (joint_indexes.empty()) {
@@ -2237,6 +2272,27 @@ class G1Deploy {
                   << "(" << sim_tick_delta_per_control_
                   << " tick units per 50 Hz control frame)" << std::endl;
       }
+      // Initialize once per process, never on the real-time observation path.
+      const char* gesture_enabled = std::getenv("SONIC_ENABLE_GESTURE_COMPOSITION");
+      if (gesture_enabled && std::string(gesture_enabled)=="1") {
+        const char* fd_text=std::getenv("SONIC_GESTURE_FD");
+        const char* session=std::getenv("SONIC_GESTURE_SESSION_ID");
+        const char* lowstate_topic=std::getenv("SONIC_LOWSTATE_TOPIC");
+        const char* lowcmd_topic=std::getenv("SONIC_LOWCMD_TOPIC");
+        if (!sync_reference_to_sim_tick_ || sim_tick_delta_per_control_!=4 || dds_domain!=42 ||
+            !lowstate_topic || std::string(lowstate_topic)!="rt/socialnav_sim/g1/lowstate" ||
+            !lowcmd_topic || std::string(lowcmd_topic)!="rt/socialnav_sim/g1/lowcmd" ||
+            !fd_text || !session || !*session) {
+          throw std::invalid_argument("Gesture receiver requires private channel and isolated simulation topics");
+        }
+        std::size_t consumed=0;
+        int fd=std::stoi(fd_text,&consumed);
+        if(consumed!=std::string(fd_text).size() || fd<3)
+          throw std::invalid_argument("Invalid gesture descriptor");
+        gesture_receiver_=std::make_unique<sonic_gesture::GestureReceiver>(fd,session,0);
+        ::close(fd); // receiver owns its duplicate; do not retain parent endpoint
+        std::cout << "[Gesture] Private persistent receiver ready" << std::endl;
+      }
       sim_allow_idle_lowstate_gap_ =
           std::getenv("SONIC_SIM_ALLOW_IDLE_LOWSTATE_GAP") != nullptr;
       if (sim_allow_idle_lowstate_gap_) {
@@ -3118,6 +3174,50 @@ class G1Deploy {
      *    initial_encoder_mode_ (-1 = stop, 0+ = fall back to local encoder).
      */
     bool GatherInputInterfaceData() {
+      // Snapshot once per control tick, never independently for q and dq.
+      auto incoming_gesture = input_interface_->GetGestureSnapshot();
+      if (gesture_receiver_) {
+        try {
+          gesture_receiver_->SetTick(last_sim_control_tick_);
+          auto received=gesture_receiver_->Snapshot();
+          if(incoming_gesture && received) throw std::runtime_error("Conflicting gesture input owners");
+          if(received) incoming_gesture=std::move(received);
+        } catch(const std::exception& error) {
+          std::cerr << "[Gesture] Receiver failed: " << error.what() << std::endl;
+          operator_state.stop=true;
+          return false;
+        }
+      }
+      if (!incoming_gesture && gesture_snapshot_) {
+        for (const auto& frame : gesture_snapshot_->frames) {
+          if (frame.weight != 0 || frame.weight_rate != 0) {
+            std::cerr << "[Gesture] Input disappeared before a completed exit" << std::endl;
+            operator_state.stop = true;
+            return false;
+          }
+        }
+      }
+      gesture_snapshot_.reset();
+      if (incoming_gesture) {
+        const char* enabled = std::getenv("SONIC_ENABLE_GESTURE_COMPOSITION");
+        if (!enabled || std::string(enabled)!="1" || !sync_reference_to_sim_tick_ ||
+            sim_tick_delta_per_control_!=4 ||
+            !sonic_gesture::SnapshotCovers(*incoming_gesture,last_sim_control_tick_,
+                                          std::chrono::steady_clock::now())) {
+          std::cerr << "[Gesture] Disabled, stale or mismatched simulation snapshot"
+                    << " control_tick=" << last_sim_control_tick_
+                    << " origin_tick=" << incoming_gesture->origin_sim_tick
+                    << " age_ms=" << std::chrono::duration<double,std::milli>(
+                         std::chrono::steady_clock::now()-incoming_gesture->received_at).count()
+                    << " execution_id=" << incoming_gesture->execution_id
+                    << " enabled=" << (enabled ? enabled : "unset")
+                    << " sync=" << sync_reference_to_sim_tick_
+                    << " tick_delta=" << sim_tick_delta_per_control_ << std::endl;
+          operator_state.stop = true;
+          return false;
+        }
+        gesture_snapshot_ = std::make_shared<const sonic_gesture::GestureSnapshot>(*incoming_gesture);
+      }
       // Snapshot input interface data into buffers before gathering observations
       // This ensures observations, logging, and output all use the same data
       // some of the data will be overwritten by the motion dataset if we are not using the buffered interface data
@@ -4223,6 +4323,8 @@ class G1Deploy {
             return;
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
+          if(gesture_receiver_ && gesture_snapshot_)
+            gesture_receiver_->MarkConsumed(*gesture_snapshot_);
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
