@@ -80,6 +80,8 @@ namespace sonic_runtime_control {
  * the currently-active delegate so the control loop always sees live values.
  */
 class InterfaceManager : public InputInterface {
+    // Test peer injects an input without publishing robot commands.
+    friend class InterfaceManagerTestPeer;
   public:
     /// Identifies which concrete interface is currently active.
     enum class ManagedType {
@@ -289,6 +291,25 @@ class InterfaceManager : public InputInterface {
     // This makes the manager a transparent proxy that always returns live values
     
     
+    bool HasUpperBodyControl() const override {
+      return current_ ? current_->HasUpperBodyControl()
+                      : InputInterface::HasUpperBodyControl();
+    }
+
+    std::shared_ptr<const sonic_gesture::GestureSnapshot> GetGestureSnapshot() const override {
+      return current_ ? current_->GetGestureSnapshot() : nullptr;
+    }
+
+    std::pair<bool, std::array<double, 17>> GetUpperBodyJointPositions() const override {
+      return current_ ? current_->GetUpperBodyJointPositions()
+                      : InputInterface::GetUpperBodyJointPositions();
+    }
+
+    std::pair<bool, std::array<double, 17>> GetUpperBodyJointVelocities() const override {
+      return current_ ? current_->GetUpperBodyJointVelocities()
+                      : InputInterface::GetUpperBodyJointVelocities();
+    }
+
     bool HasVR3PointControl() const override {
       if (current_) {
         return current_->HasVR3PointControl();

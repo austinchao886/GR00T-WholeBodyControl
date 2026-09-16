@@ -39,6 +39,7 @@
 #include "../motion_data_reader.hpp" // For MotionDataReader, MotionSequence
 #include "../math_utils.hpp"         // For float_to_double
 #include "../localmotion_kplanner.hpp" // For PlannerState, MovementState
+#include "../gesture_composer.hpp"
 
 /**
  * @class InputInterface
@@ -62,6 +63,12 @@ public:
 
     /// Virtual destructor ensures correct cleanup of derived classes.
     virtual ~InputInterface() = default;
+
+    // Default disabled. A receiver must validate authorization/session before
+    // exposing a snapshot; caller copies it once for paired q/dq observations.
+    virtual std::shared_ptr<const sonic_gesture::GestureSnapshot> GetGestureSnapshot() const {
+      return nullptr;
+    }
 
     // ------------------------------------------------------------------
     // Pure-virtual interface
