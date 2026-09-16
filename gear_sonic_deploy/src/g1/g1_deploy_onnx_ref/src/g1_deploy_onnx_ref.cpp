@@ -64,6 +64,9 @@
 #include <unordered_map>
 #include <fstream>
 #include <iostream>
+#include <sstream>
+#include "../include/planner_seam_diagnostics.hpp"
+#include "../include/planner_blend.hpp"
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -189,6 +192,7 @@ class G1Deploy {
     bool sim_idle_lowstate_gap_active_ = false;
     bool sim_tick_initialized_ = false;
     uint32_t last_sim_control_tick_ = 0;
+    unsigned planner_seam_diagnostic_events_ = 0;
     uint32_t sim_tick_delta_per_control_ = 4;  // Isaac: 200 Hz physics / 50 Hz policy
     uint32_t sim_history_warmup_ticks_ = 0;
     uint32_t sim_history_warmup_remaining_ = 0;
@@ -3519,6 +3523,16 @@ class G1Deploy {
               // choosing 8 for the width of the blend region because this is about the size of the
               // context we use for conditioning the planner model
               const int blend_num_frames = 8;
+              const char* seam_flag = std::getenv("SONIC_PLANNER_SEAM_DIAGNOSTICS");
+              const bool measure_seam = sync_reference_to_sim_tick_ &&
+                  seam_flag && std::string(seam_flag)=="1" &&
+                  planner_seam_diagnostic_events_ < 512;
+              sonic_diagnostics::PlannerSeam seam;
+              // Experimental reference-only change. Legacy remains default;
+              // never activate for an unsynchronized/hardware control loop.
+              const char* c2_flag = std::getenv("SONIC_EXPERIMENTAL_C2_PLANNER_BLEND");
+              const bool c2_blend = sync_reference_to_sim_tick_ && c2_flag &&
+                  std::string(c2_flag)=="1";
 
               // step through the frames and blend the animations:
               for(int f = 0; f < new_anim_length; ++f)
@@ -3535,11 +3549,33 @@ class G1Deploy {
                 // calculate linearly decaying blend weight:
                 double w_new = double(f - blend_start_frame) / blend_num_frames;
                 w_new = std::clamp(w_new, 0.0, 1.0);
+                sonic_reference::Weight blend_weight{w_new,0.};
+                if (c2_blend) {
+                  blend_weight=sonic_reference::QuinticWeight(
+                      double(f-blend_start_frame)/blend_num_frames,
+                      blend_num_frames*.02);
+                  w_new=blend_weight.value;
+                }
                 double w_old = 1.0 - w_new;
 
                 // blend joint_positions + joint_velocities:
                 for(size_t j=0; j < planner_motion_->GetNumJoints(); ++j)
                 {
+                  if (measure_seam) seam.Observe(
+                      planner_motion_->JointPositions(f_old)[j],
+                      planner_motion_gen.JointPositions(f_new)[j],
+                      f, blend_start_frame, blend_num_frames, .02);
+                  if (c2_blend) {
+                    // Read old q before in-place storage: f_old can equal f.
+                    const auto joint=sonic_reference::BlendJoint(
+                        planner_motion_->JointPositions(f_old)[j],
+                        planner_motion_->JointVelocities(f_old)[j],
+                        planner_motion_gen.JointPositions(f_new)[j],
+                        planner_motion_gen.JointVelocities(f_new)[j],blend_weight);
+                    planner_motion_->JointPositions(f)[j]=joint.q;
+                    planner_motion_->JointVelocities(f)[j]=joint.dq;
+                    continue;
+                  }
                   planner_motion_->JointPositions(f)[j] = 
                     w_old * planner_motion_->JointPositions(f_old)[j] +
                     w_new * planner_motion_gen.JointPositions(f_new)[j];
@@ -3563,6 +3599,21 @@ class G1Deploy {
               }
 
               // set the new timestep count and reset the current frame to 0:
+              if (measure_seam) {
+                std::ostringstream line;
+                line << "[PlannerSeam] event=" << ++planner_seam_diagnostic_events_
+                     << " control_tick=" << last_sim_control_tick_
+                     << " old_frame=" << current_frame_ << " generation_frame=" << fgen
+                     << " blend_start=" << blend_start_frame
+                     << " samples=" << seam.samples << " invalid=" << seam.invalid
+                     << " max_q_gap=" << seam.max_position_gap_rad
+                     << " max_omitted_dq=" << seam.max_omitted_velocity_rad_s << '\n';
+                // max_omitted_dq remains the counterfactual LINEAR diagnostic;
+                // mark the applied profile so it cannot be mistaken for C2 error.
+                line << "[PlannerBlendProfile] event=" << planner_seam_diagnostic_events_
+                     << " c2_kinematic=" << c2_blend << '\n';
+                std::cout << line.str();
+              }
               planner_motion_->timesteps = new_anim_length;
               success = true;
             }
